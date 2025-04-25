@@ -2,7 +2,6 @@ use ndarray::{Array2, Axis};
 use rand::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
-use std::fmt::format;
 use fastrand;
 use itertools::Itertools;
 use ndarray::parallel::prelude::*;

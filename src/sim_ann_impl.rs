@@ -1,19 +1,20 @@
 use crate::graph::Graph;
 use std::collections::{HashSet, VecDeque};
+use std::hash::Hash;
 use fastrand;
-use ndarray::range;
 use crate::sim_ann_impl::MonitorAction::Nothing;
 /*
 ========================= todos =========================
 
 TODO: make the city insertions/removals not retarded
+TODO: Add subpath optimizations
 TODO: don't forget to take out profanities
 
 ==========================================================
 */
 
 const KB: f64 = 1.;
-const T_MAX: f64 = 10000.;
+const T_MAX: f64 = 1000.;
 const T_MIN: f64 = 10.;
 
 pub struct Sim {
@@ -24,10 +25,12 @@ pub struct Sim {
     plateau_count: u8,
     city_map: Graph,
     city_size: usize,
-    energy_monitor: Energy_monitor,
+    energy_monitor: EnergyMonitor,
+    best_path: Vec<usize>,
+    best_en: usize
 }
 
-pub struct Energy_monitor{
+pub struct EnergyMonitor {
 
     // an energy management struct for Sim. Sim remembers only the current iteration's energy.
     // Energy monitor on the other hand remembers last N iterations to detect plateaus and
@@ -48,11 +51,15 @@ pub enum MonitorAction{
     // action enum that the run_check() of energy monitor emits,
     // signalling all guarding actions that the monitor tells the sim to do in case of
     // if getting stuck
-
     Nothing,
     PertrubAndIncrease {
         shuffle_frac: f64,
         delta: f64,
+    },
+    Update_best_path {
+        // if this pops out a true, it is going to make the simulation run automatically
+        // update the self.best_path and best_en to the current iteration's energy and path
+        update: bool
     }
 }
 
@@ -105,13 +112,15 @@ impl Sim {
 
         Sim
         {
-            path:init_path.0,
+            path:init_path.0.clone(),
             temp:starting_temp,
-            energy:init_path.1,
+            energy:init_path.1.clone(),
             plateau_count:0,
             city_map,
             city_size,
-            energy_monitor: Energy_monitor::new(init_path.1, 5)
+            energy_monitor: EnergyMonitor::new(init_path.1, 5),
+            best_path: init_path.0,
+            best_en: init_path.1
         }
     }
 
@@ -233,8 +242,8 @@ impl Sim {
             "randmut" => {
 
                 let decision = fastrand::f64();
-                // 10% chance to add a vertex onto the path
-                if decision < 0.1
+                // 1% chance to add a vertex onto the path
+                if decision < 0.01
                 {
                     let randinsert = fastrand::usize(0..size);
                     self.path.insert(randinsert, fastrand::usize(0..size));
@@ -297,7 +306,6 @@ impl Sim {
         // the current solution is going to get updated, it's currently a pointer undercover to
         // the path field of sim struct
         let mut retries: usize = 0;
-        let mut sol = Vec::new();
         let mut en = self.energy.clone();
         let size_init = self.path.len().clone();
         let mut max_iter = nsteps;
@@ -314,6 +322,11 @@ impl Sim {
 
                 println!("===== ITERATION {iter} =====");
 
+                /*
+
+                 ==== GENERAL SETUP ====
+
+                */
 
                 let mut sim_temp = self.temp.clone();
                 self.close_path()?;
@@ -324,20 +337,48 @@ impl Sim {
 
 
                 // perturb config at the start of each iteration step - has the chance to append new cities
-                self.perturb_config(0.1, "randmut")?;
+                self.perturb_config(0.1, "normal")?;
 
-
+                // balances out the possibilites of randmut randomly slapping a new city in, or magicking out
+                // a vertex out of nowhere
                 if self.path.len() > size_init {
                     let proba_rem = fastrand::f64();
                     if proba_rem > 0.1 {
                         let randix = fastrand::usize(1..self.path.len()-1);
-                        self.path.remove(randix);
-                    }
+
+                        let vertex_to_remove = self.path[randix];
+                        let count = self.path.iter().filter(|&&c|c==vertex_to_remove).count();
+
+                        if count > 1 {
+                           self.path.remove(randix);
+                        };
+
+                    };
+                };
+
+                /*
+
+                ==== NESTED OPTIMIZATIONS ====
+
+                */
+
+                if iter % 20 == 0 && self.path.len() > 5 {
+                    let segment_size = (self.path.len() / 5).max(3).min(10);
+                    let start_idx = fastrand::usize(0..self.path.len() - segment_size);
+
+                    let end_idx = start_idx + segment_size;
+
+                    self.optimize_subpath(start_idx, end_idx)?;
                 }
 
+                if iter % 50 == 0 {
+                    self.optimize_shortcuts()?;
+                }
 
-                let iter_config = self.path.clone();
+                // save the best path encountered, since it can happen literally anywhere
+
                 let mut iter_energy = self.calculate_energy()? as f64;
+                let mut iter_config = self.path.clone();
 
                 // set decision variables
                 match self.energy_monitor.update(iter_energy as usize, iter)? {
@@ -345,11 +386,18 @@ impl Sim {
                         println!("Plateau detected");
                         self.perturb_config(shuffle_frac, "normal")?;
                         self.temp += delta;
+                    },
+                    MonitorAction::Update_best_path{update} => {
+                        println!("New optimim discovered!");
+                        self.best_path = iter_config.clone();
+                        self.best_en = iter_energy as usize;
                     }
                     Nothing => {
                         // just does nothing
                     }
                 }
+
+
 
                 // ==== probability related vars ====
                 let delta_en = iter_energy - pre_perturb_energy;
@@ -368,7 +416,12 @@ impl Sim {
                 println!("Iteration proba: {sigmoid_output_proba}, acceptance rolled: {acceptance}");
 
 
-                // ==== UPDATE ====
+                /*
+
+                 ==== UPDATE ====
+
+                */
+
 
                 if delta_en > 0. && self.energy_monitor.relative_change_iter > 1. {
                     // this would mean we've most likely taken an illegal turn, since this condition
@@ -376,7 +429,6 @@ impl Sim {
                     println!("Likely illegal move detected, rejecting config");
                     self.path = pre_perturb_config;
                     self.energy = pre_perturb_energy as usize;
-                    sol = self.path.clone();
 
                     if !self.energy_monitor.memory.is_empty() {
                         // forget the rejected config's energy as well as the config.
@@ -394,13 +446,13 @@ impl Sim {
                         println!("Config accepted");
                         self.path = iter_config;
                         self.energy = iter_energy as usize;
-                        sol = self.path.clone();
+
+
                     } else {
 
                         println!("Config rejected");
                         self.path = pre_perturb_config;
                         self.energy = pre_perturb_energy as usize;
-                        sol = self.path.clone();
 
                         if !self.energy_monitor.memory.is_empty() {
                             // forget the rejected config's energy as well as the config.
@@ -421,7 +473,7 @@ impl Sim {
             }
 
             println!("====MAIN RUN OVER====");
-            if self.energy > en {
+            if self.best_en >= en {
 
                 let restart_steps:usize = (max_iter + 100) / 5;
 
@@ -445,18 +497,227 @@ impl Sim {
 
         }
 
-        if en < self.energy {
+        if en < self.best_en {
             println!("Simulation failed to reduce path energy")
         } else {
             println!("Optimization succesful!")
         }
-
-        let en = self.energy;
-        Ok((sol, en))
+        println!("{:?}", self.best_path);
+        Ok((self.best_path.clone(), self.best_en.clone()))
     }
+
+    fn nested_sim_ann(&self, start_city:usize, end_city:usize, must_visit: &HashSet<usize>) -> Result<Vec<usize>, String>{
+
+        // miniature simulation annealing running for the subpaths
+
+        let subproblem_size = must_visit.len();
+        let iterations = (subproblem_size * 20).max(100);
+
+        // not using the temp scheduler here, since that is tied to the sim struct and i don't want to
+        // mess the main sim ann run
+        let cooling_rate = 0.95;
+
+        let mut current_path = vec![start_city];
+        current_path.extend(must_visit.iter().cloned());
+        current_path.push(end_city);
+
+        let mut current_energy = self.calculate_path_energy_on_slices(&current_path)?;
+
+        let mut init_temp = 1000.;
+        let mut temp = init_temp;
+
+        let mut best_path = current_path.clone();
+        let mut best_energy = current_energy;
+
+        for iter in 0..iterations{
+
+            let mut neighbor_path = current_path.clone();
+            self.perturb_subpath(&mut neighbor_path, must_visit)?;
+
+            let neighbor_energy = self.calculate_path_energy_on_slices(&neighbor_path)?;
+
+            let accept = if neighbor_energy < current_energy {
+                true
+            } else {
+                let delta_e = (neighbor_energy - current_energy) as f64;
+                let proba = (-delta_e / temp).exp();
+
+                fastrand::f64() < proba
+            };
+
+            if accept{
+                current_path = neighbor_path;
+                current_energy = neighbor_energy;
+
+                if current_energy < best_energy {
+                    best_energy = current_energy;
+                    best_path = current_path.clone();
+                }
+            }
+
+
+            temp *= cooling_rate;
+        }
+        Ok(best_path)
+    }
+    fn optimize_shortcuts(&mut self) -> Result<(), String>{
+
+        let mut improved = true;
+        let mut total_savings = 0;
+
+
+        while improved {
+            improved = false;
+            for i in 0..self.path.len() - 2{
+
+                // calculate for triples
+                let city_1 = self.path[i];
+                let city_2 = self.path[i+1];
+                let city_3 = self.path[i+2];
+
+                if city_1 == city_2 || city_2 == city_3 {
+                    continue;
+                }
+
+                let current_cost = match (self.city_map.get_edge_weight(city_1, city_2), self.city_map.get_edge_weight(city_2, city_3)){
+                    (Ok(cost1), Ok(cost2)) => cost1 + cost2,
+                    _ => continue
+                };
+
+
+                let shortcut_cost = match self.city_map.get_edge_weight(city_1, city_3){
+                    Ok(cost) => cost,
+                    _ => continue
+                };
+
+                if shortcut_cost < current_cost {
+                    let count_2:usize = self.path.iter().filter(|&&c| c == city_2).count();
+
+                    // take the shortcut only if all cities were already visited, or we've already
+                    // passed the middle city more than once
+                    let all_cities_visited = match self.validate_config() {
+                        Ok(valid) => valid && count_2 > 1,
+                        _ => false
+                    };
+
+                    if all_cities_visited{
+                        self.path.remove(i+1);
+                        total_savings += current_cost - shortcut_cost;
+                        improved = true;
+                        break;
+                    }
+
+                }
+
+
+            }
+
+        }
+        if total_savings > 0 {
+            self.energy = self.calculate_energy()?;
+        }
+
+        Ok(())
+    }
+    fn optimize_subpath (&mut self, start_idx:usize, end_idx:usize) -> Result<(), String>{
+
+        if start_idx  >= self.path.len() || end_idx >= self.path.len() || start_idx >= end_idx{
+            // silent return check to ignore invalid indices
+            return Ok(())
+        }
+
+        let start_city = self.path[start_idx];
+        let end_city = self.path[end_idx];
+
+        // hashset of indices
+        let cities_to_visit: HashSet<usize> = self.path[start_idx+1..end_idx].iter().cloned().collect();
+        if cities_to_visit.len() <= 1 {
+            return  Ok(())
+        }
+
+        let mut relevant_cities = cities_to_visit.clone();
+        relevant_cities.insert(start_city);
+        relevant_cities.insert(end_city);
+
+        let optimised_path = self.nested_sim_ann(start_city, end_city, &cities_to_visit)?;
+        let opt_len = optimised_path.len().clone();
+        self.path.splice(start_idx+1..end_idx, optimised_path.into_iter().skip(1).take(opt_len-2));
+
+        self.energy = self.calculate_energy()?;
+
+
+
+        Ok(())
+    }
+    fn calculate_path_energy_on_slices(&self, path: &[usize]) -> Result<usize, String>{
+
+        let mut en_total:usize = 0;
+
+        for edge in path.windows(2){
+
+            let a = *edge.get(0).ok_or("Edge missing or invalid")?;
+            let b = *edge.get(1).ok_or("Edge missing or invalid")?;
+
+            let weight = self.city_map.get_edge_weight(a, b)
+                .unwrap_or(10000);
+            en_total += weight
+        }
+        Ok(en_total)
+
+    }
+    fn perturb_subpath(&self, path: &mut Vec<usize>, must_visit: &HashSet<usize>) -> Result<(), String>{
+
+        let mut visited = HashSet::new();
+        visited.insert(path[0]);
+
+        let operation = fastrand::usize(0..3);
+        match operation {
+            0 => {
+                let idx1 = fastrand::usize(1..path.len()-1);
+                let idx2= fastrand::usize(1..path.len()-1);
+                path.swap(idx1, idx2);
+            },
+            1 => {
+                let insrt_pos = fastrand::usize(1..path.len()-1);
+                let new_city = if fastrand::f64() < 0.7 && !must_visit.is_empty(){
+                    let missing: Vec<_> = must_visit.iter().cloned().collect();
+                    missing[fastrand::usize(0..missing.len())]
+                } else {
+                    fastrand::usize(0..self.city_size)
+                };
+
+                path.insert(insrt_pos, new_city);
+            },
+            2 => {
+                // rem random if it's not the only occurence
+                if path.len() > 3 {
+                    let remove_pos = fastrand::usize(1..path.len()-1);
+                    let city_to_remove = path[remove_pos];
+
+                    //occurences of the city to remove
+                    let occurences = path.iter().filter(|&&c| c == city_to_remove).count();
+                    if !must_visit.contains(&city_to_remove) || occurences > 1 {
+                        path.remove(remove_pos);
+                    }
+                }
+            },
+            _ => unreachable!()
+        }
+
+        for &required in must_visit {
+            if !path.contains(&required){
+                let inser_pos = fastrand::usize(1..path.len());
+                path.insert(inser_pos, required)
+            }
+        }
+
+        Ok(())
+    }
+
+
 }
 
-impl Energy_monitor{
+impl EnergyMonitor {
 
     //Monitors the system's energy; if a plateau is reached, it calls permute path since it's most
     //likely stuck in a local minimum and bumps up the temperature a bit to let it explore around
@@ -471,7 +732,7 @@ impl Energy_monitor{
 
         energy.push_back(starting_energy);
 
-        Energy_monitor
+        EnergyMonitor
         {
             best_seen:starting_energy as f64,
             worst_seen:starting_energy as f64,
@@ -533,6 +794,7 @@ impl Energy_monitor{
 
         if self.plateau_count > 5 && iteration > 10 {
             // that means we're most likely in a plateau
+            self.plateau_count = 0;
             true
         } else {
 
@@ -577,10 +839,11 @@ impl Energy_monitor{
 
         // push the current iteration's energy into the memory deque
         let iter_energy_flt: f64 = iter_energy as f64;
-
+        let mut update_path: bool = false;
 
         if iter_energy_flt < self.best_seen{
-            self.best_seen = iter_energy_flt
+            self.best_seen = iter_energy_flt;
+            update_path = true;
         };
 
         if iter_energy_flt > self.worst_seen{
@@ -606,7 +869,11 @@ impl Energy_monitor{
                 shuffle_frac: self.calc_shuffle_factor(plateau_check)?,
                 delta: 100.,
             }
-        } else {
+        } else if update_path{
+            MonitorAction::Update_best_path {
+                update: true
+            }
+        } else{
             Nothing
         };
         Ok(action)

@@ -1,5 +1,5 @@
 use crate::graph::Graph;
-use crate::sim_ann_impl::{fisher_yates_variable, Sim};
+use crate::sim_ann_impl::Sim;
 
 mod graph;
 mod sim_ann_impl;
@@ -17,24 +17,17 @@ fn main() {
     // WARNING, ANYTHING OVER 10000 crashes your computer
     let graph = Graph::new(10, 1.).expect("An unexpected error occured");
 
-    println!("{graph}");
+    //println!("{graph}");
     let _ = log_time!("neighbr retrieval current code", {graph.get_neighbors(0)});
     let _ = log_time!("initial path generation", {
         Sim::generate_tour(&graph)
     });
-    // takes about 15 ms for 100 vertex graph. No gucci
-
-    //let mut sim: Sim = Sim::new(graph, 1000.);
-
-    //println!("{:?}", sim.path);
-    //println!("{:?}", sim.path.len());
-    //println!("{:?}", sim.energy)
 
 
     let mut sim_test = Sim::new(graph, 10000.);
     let pre_run_enrgy: usize = sim_test.energy.clone();
     let pre_run_path: Vec<usize> = sim_test.path.clone();
-    let (sol, en) = sim_test.run(10).expect("Error in simulation");
+    let (sol, en) = sim_test.run(100).expect("Error in simulation");
 
     println!("Energy pre-run: {pre_run_enrgy}, post-run: {en}");
     println!("Path pre-run: {:?}", pre_run_path);
