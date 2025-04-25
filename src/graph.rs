@@ -1,7 +1,13 @@
-use ndarray::Array2;
+use ndarray::{Array2, Axis};
 use rand::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
+use std::fmt::format;
+use fastrand;
+use itertools::Itertools;
+use ndarray::parallel::prelude::*;
+use rayon::prelude::*;
+
 
 #[derive(Debug, Clone)]
 pub struct Vertex
@@ -10,8 +16,17 @@ pub struct Vertex
     pub id: usize,
     pub name: String,
 }
+/*
+======================== TODOS =========================
 
-// TODO: allow for non-usize edge weights
+TODO: allow for non-usize edge weights => that was a
+      needless rabbit hole, I'll jsut go with casting
+      back and forth, since it's O(1) anyway.
+TODO: parallelize the simulation once we're done =>
+      screw that.
+
+========================================================
+*/
 pub struct Graph
 {
     pub vertices: Vec<Vertex>,
@@ -21,12 +36,14 @@ pub struct Graph
 }
 
 impl Vertex {
-    pub fn new(id: usize, name:String) -> Self{
+    pub fn new(id: usize, name:&String) -> Self{
+        
+        let name_unwrapped = name.clone();
 
         Vertex
         {
-            id,
-            name,
+            id: id,
+            name: name_unwrapped,
         }
 
     }
@@ -35,23 +52,22 @@ impl Vertex {
 impl Graph{
     // equivalent of __init__ in python
     // Core constructor for the graph class
-    pub fn new(vertex_names:Vec<String>, density:f32) -> Result<Self, String>{
+    pub fn new(num_vertices: usize, density:f32) -> Result<Self, String>{
 
-        let mut rng = rand::rng();
-        let size: usize= vertex_names.len();
+        const MAX: usize = 800;
+        //preallocations and scoping
+        let size: usize= num_vertices;
         let num_connections_max = (size * (size - 1)) / 2;
-        let cons_to_use = (density * num_connections_max as f32) as i32;
+        let cons_to_use = (density * num_connections_max as f32) as usize;
+
         let adjacency_matrix:Array2<usize> = Array2::zeros((size, size));
 
         let mut possible_edges:Vec<(usize, usize)> = Self::precalculate_all_possible_edges(size);
-
+        let vertex_names: Vec<String> = Self::generate_vertex_names(num_vertices);
 
         let vertices: Vec<Vertex> = vertex_names.iter()
             .enumerate()
-            .map(|(id, name)| Vertex{
-                id,
-                name: name.clone(),
-            })
+            .map(|(id, name)| Vertex::new(id, name))
             .collect();
 
         let name_to_id = vertices.iter()
@@ -67,35 +83,51 @@ impl Graph{
         };
 
         // assign edges based on the number of connections to use and weigh them
-        // pre-shuffle the edges
-        possible_edges.shuffle(&mut rng);
 
-        for edge in possible_edges.into_iter().take(cons_to_use as usize){
+        //parital fisher-yates shuffle
 
-            let edge_weight = rng.random_range(0..200);
-            graph.make_an_edge(edge.0, edge.1)?;
-            graph.kill_orphans()?;
-            graph.set_edge_weight(edge.0, edge.1, edge_weight)?;
-
+        let len_of_edges = possible_edges.len();
+        for idx in (1..len_of_edges-1){
+            let j = fastrand::usize(0..len_of_edges);
+            possible_edges.swap(idx, j)
         }
 
+
+        let edge_list: Vec<(usize, usize, usize)> = possible_edges
+            .par_iter()
+            .take(cons_to_use)
+            .map(|&(i,j)| {
+                let weight = fastrand::usize(0..MAX);
+                (i, j, weight)
+            })
+            .collect();
+
+        for (i, j, weight) in edge_list{
+            graph.make_an_edge_weighed(i,j,weight)?
+        }
+
+        graph.kill_orphans()?;
         Ok(graph)
+    }
+
+    fn generate_vertex_names(num_vertices: usize) -> Vec<String>{
+
+        let mut vertex_names: Vec<String> = Vec::new();
+        for i in 0..num_vertices{
+            vertex_names.push(String::from(format!("city{}", i)))
+        };
+        vertex_names
     }
 
     fn precalculate_all_possible_edges(size:usize) -> Vec<(usize, usize)>{
 
-        let mut possible_edges: Vec<(usize, usize)> = Vec::new();
+        // okay, this is *very* fast now
+        let mut possible_edges: Vec<(usize, usize)> = (0..size)
+            .tuple_combinations()
+            .par_bridge()
+            .collect();
 
-        for i in 0..size{
-            for j in (i+1)..size{
-                possible_edges.push((i, j));
-            }
-        }
-
-        // fun fact, borrow checker and compiler check the last thing that was executed
-        // in the function for type inference, so it spazes out without the possible_edges at the
-        // end
-
+        println!("possible amount of edges: {}", possible_edges.len());
         possible_edges
     }
 
@@ -105,18 +137,19 @@ impl Graph{
         // it iterates over all columns, if any column's checksum is zero, it means
         // that the vertex is an orphan
         // if you hit an orphan, out a new edge on a random index of the column
-        let mut rng = rand::rng();
+        // currently parallelized using the rayon + ndarra::parallel combo
 
         let orphans: Vec<usize> = self
             .adjacency_matrix
-            .columns()
-            .into_iter()
+            .axis_iter(Axis(1))
+            .into_par_iter()
             .enumerate()
             .filter_map(|(i, col)| if col.sum() == 0 {Some(i)} else {None})
             .collect();
 
+
         for i in orphans{
-            let mut rand_index:usize = rng.random_range(0..self.size - 1);
+            let mut rand_index:usize = fastrand::usize(0..self.size-1);
             if rand_index >= i {
                 rand_index += 1;
             }
@@ -140,6 +173,23 @@ impl Graph{
         //symmetrically update the adjacency matrix
         self.adjacency_matrix[[a,b]] = 1;
         self.adjacency_matrix[[b,a]] = 1;
+
+        Ok(())
+    }
+
+    pub fn make_an_edge_weighed(&mut self, a:usize, b:usize, weight:usize) -> Result<(), String>{
+        if a == b
+        {
+            return Err(String::from("Location indices cannot equal each other"))
+        }
+        if a >= self.size || b >= self.size
+        {
+            return Err(String::from("Indices are out of bounds of the graph shape"))
+        }
+
+        //symmetrically update the adjacency matrix
+        self.adjacency_matrix[[a,b]] = weight;
+        self.adjacency_matrix[[b,a]] = weight;
 
         Ok(())
     }
@@ -191,9 +241,21 @@ impl Graph{
             return Err(String::from("Indices are out of bounds of the graph shape"))
         }
 
-        let weight = self.adjacency_matrix.column(a)[b];
+        // also figure out how to allow an "invalid" edge as long as there are the correct indices,
+        // just add a massive penalty
 
-        Ok(weight)
+        let weight = self.adjacency_matrix.column(a)[b];
+        match weight {
+            // this is kind of redundant considering that I use a valid path generation. Oh, well
+            0 => {
+                //println!("TELEPORT");
+                Ok(10000)
+            },
+            _ => {
+                //println!("ok");
+                Ok(weight)
+            }
+        }
     }
     pub fn get_neighbors(&self, vertex_id: usize) -> Result<Vec<((usize, usize), usize)>, String>{
 
@@ -204,23 +266,31 @@ impl Graph{
       //it also return the weight along with the edge that is outgoing from the particular
       //vertex
 
+        // currently costly asf, since it allocates a fresh vec for each call. That was probably also why it was crashing the program
+
         if vertex_id > self.vertices.len()
         {
             return  Err(String::from(format!("The vertex id is out of bounds for a graph of size{}", self.vertices.len())))
         }
 
 
-        let column_view = self.adjacency_matrix.column(vertex_id);
+        let column = self.adjacency_matrix.column(vertex_id);
         // Vec<((vertex_id, neighbor_id)), edge_weight)>
-        let neighboring_vertices: Vec<((usize, usize), usize)> = column_view.into_iter()
+        let neighboring_vertices: Vec<((usize, usize), usize)> = column
+            .iter()
             .enumerate()
-            .filter(|&x| *x.1 != 0)
-            .map(|x| ((vertex_id, x.0), *x.1))
+            .par_bridge()
+            .filter_map(|(j, &weight)|{
+                if weight != 0 {
+                    Some(((vertex_id, j), weight))
+                } else {
+                    None
+                }
+            })
             .collect();
 
         Ok(neighboring_vertices)
     }
-
 
     pub fn wipe_config(&mut self) {
         // completely wipe the adjacency matrix, just in case
