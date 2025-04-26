@@ -2,13 +2,17 @@ use crate::graph::Graph;
 use std::collections::{HashSet, VecDeque};
 use std::hash::Hash;
 use fastrand;
-use crate::sim_ann_impl::MonitorAction::Nothing;
+use rayon::prelude::*;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use itertools::Itertools;
 /*
 ========================= todos =========================
 
 TODO: make the city insertions/removals not retarded
 TODO: Add subpath optimizations
 TODO: don't forget to take out profanities
+TODO: pralelize the genetic algo by hand, no rayon.
 
 ==========================================================
 */
@@ -44,6 +48,22 @@ pub struct EnergyMonitor {
     memory_window_size: usize,
     relative_change_iter: f64,
     memory_range: f64,
+}
+
+
+#[derive(Debug)]
+pub struct Population {
+    // I'll most likely not need the pop_size?
+    city: Graph,
+    pop_size: usize,
+    pub generation: Vec<Individual>,
+    mutation_rate: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord)]
+pub struct Individual {
+    chromosome: Vec<usize>,
+    fitness: usize,
 }
 
 pub enum MonitorAction{
@@ -320,7 +340,6 @@ impl Sim {
 
             while iter < max_iter {
 
-                println!("===== ITERATION {iter} =====");
 
                 /*
 
@@ -383,7 +402,6 @@ impl Sim {
                 // set decision variables
                 match self.energy_monitor.update(iter_energy as usize, iter)? {
                     MonitorAction::PertrubAndIncrease {shuffle_frac, delta} => {
-                        println!("Plateau detected");
                         self.perturb_config(shuffle_frac, "normal")?;
                         self.temp += delta;
                     },
@@ -392,7 +410,7 @@ impl Sim {
                         self.best_path = iter_config.clone();
                         self.best_en = iter_energy as usize;
                     }
-                    Nothing => {
+                    MonitorAction::Nothing => {
                         // just does nothing
                     }
                 }
@@ -411,9 +429,7 @@ impl Sim {
                 let sigmoid_output_proba: f64 = 1. / (1. + (-z_t/self.energy_monitor.memory_range).exp());
                 let acceptance: f64 = fastrand::f64();
 
-                // ==== SUMMARY PRINTS ====
-                println!("Iteration energy: {iter_energy}, iteration delta_e {delta_en}");
-                println!("Iteration proba: {sigmoid_output_proba}, acceptance rolled: {acceptance}");
+
 
 
                 /*
@@ -426,7 +442,6 @@ impl Sim {
                 if delta_en > 0. && self.energy_monitor.relative_change_iter > 1. {
                     // this would mean we've most likely taken an illegal turn, since this condition
                     // is satisfied only when the change of energy is massive.
-                    println!("Likely illegal move detected, rejecting config");
                     self.path = pre_perturb_config;
                     self.energy = pre_perturb_energy as usize;
 
@@ -435,39 +450,41 @@ impl Sim {
                         // the simulation is dependent on the memory window, but trying to keep
                         // even the horrendous energies encountered would then steer the simulation
                         // to very weird rabbit holes and destabilize it
-                        println!("Memory pre-pop: {:?}", self.energy_monitor.memory);
                         self.energy_monitor.memory.pop_front();
-                        println!("Memory post-pop: {:?}", self.energy_monitor.memory);
                     }
 
                 } else {
 
                     if delta_en < 0. || sigmoid_output_proba > acceptance {
-                        println!("Config accepted");
                         self.path = iter_config;
                         self.energy = iter_energy as usize;
 
 
                     } else {
 
-                        println!("Config rejected");
                         self.path = pre_perturb_config;
                         self.energy = pre_perturb_energy as usize;
 
                         if !self.energy_monitor.memory.is_empty() {
                             // forget the rejected config's energy as well as the config.
-                            println!("Memory pre-pop: {:?}", self.energy_monitor.memory);
                             self.energy_monitor.memory.pop_front();
-                            println!("Memory post-pop: {:?}", self.energy_monitor.memory);
                         }
 
                     }
 
                 }
 
-
                 self.temp_scheduler(sim_temp, nsteps)?;
-                println!("Sim temperature pre-step {sim_temp}, post-step: {}", self.temp);
+
+                // ==== SUMMARY PRINTS ====
+
+                if iter % 10000 == 0{
+                    println!("===== ITERATION {iter} =====");
+                    println!("Iteration energy: {iter_energy}, iteration delta_e {delta_en}");
+                    println!("Iteration proba: {sigmoid_output_proba}, acceptance rolled: {acceptance}");
+                    println!("Best seen energy: {}, Worst seen energy: {}", self.energy_monitor.best_seen, self.energy_monitor.worst_seen);
+                    println!("Current temperature: {}", self.temp)
+                }
 
                 iter += 1;
             }
@@ -477,7 +494,7 @@ impl Sim {
 
                 let restart_steps:usize = (max_iter + 100) / 5;
 
-                println!("Simulation failed to converge to an optimum, restarting run");
+                println!("Simulation failed to discover an optimum, restarting run");
 
                 self.temp += 1000.;
                 self.perturb_config(1., "randmut")?;
@@ -529,7 +546,7 @@ impl Sim {
         let mut best_path = current_path.clone();
         let mut best_energy = current_energy;
 
-        for iter in 0..iterations{
+        for _ in 0..iterations{
 
             let mut neighbor_path = current_path.clone();
             self.perturb_subpath(&mut neighbor_path, must_visit)?;
@@ -560,6 +577,7 @@ impl Sim {
         }
         Ok(best_path)
     }
+
     fn optimize_shortcuts(&mut self) -> Result<(), String>{
 
         let mut improved = true;
@@ -619,6 +637,7 @@ impl Sim {
 
         Ok(())
     }
+
     fn optimize_subpath (&mut self, start_idx:usize, end_idx:usize) -> Result<(), String>{
 
         if start_idx  >= self.path.len() || end_idx >= self.path.len() || start_idx >= end_idx{
@@ -649,6 +668,7 @@ impl Sim {
 
         Ok(())
     }
+
     fn calculate_path_energy_on_slices(&self, path: &[usize]) -> Result<usize, String>{
 
         let mut en_total:usize = 0;
@@ -665,6 +685,7 @@ impl Sim {
         Ok(en_total)
 
     }
+
     fn perturb_subpath(&self, path: &mut Vec<usize>, must_visit: &HashSet<usize>) -> Result<(), String>{
 
         let mut visited = HashSet::new();
@@ -713,8 +734,6 @@ impl Sim {
 
         Ok(())
     }
-
-
 }
 
 impl EnergyMonitor {
@@ -785,7 +804,6 @@ impl EnergyMonitor {
         let relative_change: f64 = memory_range / mmry_mean;
         self.relative_change_iter = relative_change;
         self.memory_range = memory_range;
-        println!("Relative change: {}", self.relative_change_iter);
 
 
         if relative_change < THRESHOLD{
@@ -849,18 +867,15 @@ impl EnergyMonitor {
         if iter_energy_flt > self.worst_seen{
             self.worst_seen = iter_energy_flt
         }
-        println!("best seen: {}, worst seen: {}", self.best_seen, self.worst_seen);
 
         // drop the thingies out of range for the init mem_window => keeping the memory a real rolling
         // window
-
         self.memory.push_front(iter_energy);
 
         if self.memory.len() > self.memory_window_size{
             self.memory.pop_back();
         };
 
-        println!("{:?}", self.memory);
 
         let plateau_check = self.detect_plateaus(iteration);
 
@@ -874,8 +889,346 @@ impl EnergyMonitor {
                 update: true
             }
         } else{
-            Nothing
+            MonitorAction::Nothing
         };
         Ok(action)
     }
+}
+
+impl Individual {
+    fn new(city: &Graph) -> Result<Self, String>{
+
+        //wraping the individual in a result so that I can paralelize generating the population
+
+        let generation = match Self::generate_individual(city){
+            Ok(generation) => generation,
+            Err(E) => panic!("Error: {E}"),
+        };
+
+        let individual = Individual{
+            chromosome: generation.0,
+            fitness: generation.1
+        };
+
+        Ok(individual)
+    }
+
+    pub fn generate_individual(city_map: &Graph) -> Result<(Vec<usize>, usize), String> {
+        let mut fitness: usize = 0;
+        let size = city_map.size.clone();
+        let mut idx = fastrand::usize(0..size);
+
+        let indices: HashSet<usize> = (0..size).collect();
+        let mut seen_vertices: HashSet<usize> = HashSet::new();
+
+        let mut backtrack_stack = Vec::new();
+        let mut chromosome: Vec<usize> = Vec::new();
+
+        seen_vertices.insert(idx);
+        chromosome.push(idx);
+
+        // TODO: make this tad better by sorting the neighbor list in ascending order
+        // that way it should technically preferably take the shortest path always
+
+
+        while indices != seen_vertices {
+            let mut neighbor_list = city_map.get_neighbors(idx)?;
+
+            let mut next_index = None;
+
+            if neighbor_list.len() > 1 {
+                for (neighbor, _) in neighbor_list {
+                    if !seen_vertices.contains(&neighbor.1) {
+                        next_index = Some(neighbor.1);
+                        break;
+                    }
+                }
+            } else if neighbor_list.len() == 1 {
+                next_index = Some(neighbor_list[0].0.1);
+            }
+
+            match next_index {
+                Some(next) => {
+                    fitness += city_map.get_edge_weight(idx, next)?;
+                    seen_vertices.insert(next);
+                    backtrack_stack.push(next);
+                    chromosome.push(next);
+                    idx = next;
+                }
+                None => {
+                    if let Some(previous) = backtrack_stack.pop() {
+                        idx = previous;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        };
+
+        if chromosome.last() != chromosome.first() {
+
+            let first  = match chromosome.first().clone(){
+                Some(&first) => first,
+                None => panic!("Something's very wrong")
+            };
+
+            let last  = match chromosome.last().clone(){
+                Some(&last) => last,
+                None => panic!("Something's very wrong")
+            };
+
+            let fitness_delta: usize = city_map.get_edge_weight(first, last)?;
+            // close the path
+            chromosome.push(first);
+            fitness += fitness_delta
+
+        }
+
+        Ok((chromosome, fitness))
+    }
+}
+
+impl Population {
+    pub fn new(pop_size:usize, city: Graph) -> Self{
+
+        // population sizes are going to be the same for each generation,
+        // it's mostly about how I splice and mix and mutate the parents
+
+
+
+        // sleek way to do it with rayon. but where's the fun in that
+        let individuals = match Self::spawn_generation_zero(&city, pop_size, 8){
+            Ok(generation) => generation,
+            Err(E) => panic!("Generation spawning failed"),
+        };
+
+        Population{
+            city: city,
+            pop_size: pop_size,
+            generation: individuals,
+            mutation_rate: 0.05
+        }
+
+
+    }
+
+    fn spawn_generation_zero(city_map: &Graph, pop_size: usize, max_threads: usize) -> Result<Vec<Individual>, String>{
+
+        /*
+        It's fast.
+         */
+
+        let city_map = Arc::new(city_map.clone());
+
+        //input channel = job queue
+        let (task_tx, task_rx) = mpsc::channel::<()>();
+        let task_rx = Arc::new(Mutex::new(task_rx));
+
+        //output channel
+        let (res_tx, res_rx) = mpsc::channel::<Result<Individual, String>>();
+
+        let mut handles = Vec::with_capacity(max_threads);
+
+        for _ in 0..max_threads{
+            let task_rx = Arc::clone(&task_rx);
+            let res_tx = res_tx.clone();
+            let city_map = Arc::clone(&city_map);
+
+            // create a thread
+            let handle = thread::spawn(move ||{
+                loop {
+                    // worker loop
+                    let job = {
+                        let rx_lock = task_rx.lock().unwrap();
+                        rx_lock.recv()
+                    };
+                    match job {
+                        Ok(()) => {
+                            let out = Individual::new(&city_map);
+                            res_tx.send(out).expect("res_tx failed to send");
+                        },
+                        Err(_) => {
+                            // no jobs remaining/shit went south => break
+                            break;
+                        }
+                    }
+                }
+            });
+            handles.push(handle)
+        };
+
+        // enqueue pop_size jobs
+        for _ in 0..pop_size{
+            task_tx.send(()).expect("task_tx failed to send");
+        }
+        drop(task_tx);
+
+        //preallocate a vector
+        let mut results = Vec::with_capacity(pop_size);
+
+        for _ in 0..pop_size{
+            match res_rx.recv().expect("res_rx failed on receive"){
+                Ok(indiv) => results.push(indiv),
+                Err(E) => eprintln!("Generation error: {}", E),
+            }
+        };
+
+        for h in handles{
+            h.join().expect("Thread panicked!")
+        }
+
+        Ok(results)
+    }
+
+    fn calculate_fitness(&mut self, chromosome:Vec<usize>) -> Result<(Vec<usize>, usize), String>{
+
+        /*
+        calculate fitness of an individual
+        it receives the idx of the individual and then just converts
+        its path into energy
+         */
+
+        let city = &self.city;
+        let mut chromosome_to_calculate = chromosome.clone();
+
+        //closes the path if it was not so at the start
+        if chromosome_to_calculate.last() != chromosome_to_calculate.first(){
+            chromosome_to_calculate.push(*chromosome_to_calculate.first().unwrap());
+        }
+
+        let fitness:usize = chromosome_to_calculate
+            .windows(2)
+            .par_bridge()
+            .map(|a| {
+                let weight = match city.get_edge_weight(*a.get(0).unwrap(), *a.get(1).unwrap()){
+                    Ok(weight) => weight,
+                    Err(E) => panic!("Something's wrong, I can feel it")
+                };
+                weight
+            })
+            .sum();
+
+
+        Ok((chromosome_to_calculate, fitness))
+
+    }
+
+    pub fn tournament_selection(&mut self, elitism_factor: f64) -> Vec<Individual>{
+
+        // elitism factor is a further regularization to take the
+        // survival of the fittest to overdrive. Reduces the 200 population to
+        // some ~20-ish individuals
+
+        // sort the individuals by fitness in descending order
+        // well, the fitness is in ascending order, but the
+        // individual's viability is in descening
+
+        let sorted_indivs: Vec<Individual> = self.generation
+            .clone()
+            .into_iter()
+            .sorted_by(|a, b| a.fitness.cmp(&b.fitness))
+            .collect();
+
+
+        let best_fit = sorted_indivs.first().map(|x| x.fitness).unwrap_or(0) as f64;
+        let worst_fit = sorted_indivs.last().map(|x|x.fitness).unwrap_or(0) as f64;
+        println!("worst fitness: {worst_fit}");
+
+        // the higher the weight, the more fit the individual is in the selection
+        // yes, this is just a minmax scaler
+
+        let selection_weights: Vec<f64> = sorted_indivs
+            .iter()
+            .map(|indiv|{
+                (worst_fit - indiv.fitness as f64) / (worst_fit - best_fit)
+            }).collect();
+
+
+        let mut parents:Vec<Individual> = Vec::new();
+
+        for (idx, indiv) in sorted_indivs.iter().enumerate(){
+
+            let sel_proba = fastrand::f64() + elitism_factor;
+            if selection_weights[idx] > sel_proba{
+                parents.push(indiv.clone())
+            }
+        }
+
+        //println!("Selected parents: {:?}", parents);
+        println!("Num selected: {}", parents.len());
+        parents
+
+
+    }
+
+    fn crossover(&self, parents: Vec<Individual>){
+
+        // TODO: figure out something not absolutely brain dead to do the corssovers between parents
+
+    }
+    fn mutate(&mut self, mut individual: Individual) -> Individual{
+
+        // chooses a random index in the chromosome and performs one of three actions
+        // either swaps two indices, removes ranodm index, or inserts a random index
+
+        let randix = fastrand::usize(0..individual.chromosome.len());
+        let choice = fastrand::usize(0..3);
+
+        let mut new_chromosome:Vec<usize> = individual.chromosome.clone();
+
+        match choice{
+            0 => {
+                let a = fastrand::usize(0..individual.chromosome.len());
+                let b = fastrand::usize(0..individual.chromosome.len());
+
+                new_chromosome.swap(a, b)
+
+            },
+            1 => {
+                //inserts a random city to the path
+                let randinsert = fastrand::usize(0..self.city.size);
+                if fastrand::f64() < 0.5 {
+                    //coin toss for insertion
+                    new_chromosome.insert(randix, randinsert)
+                } else {
+                    //just shuffle the child with very slight shuffle frac
+                    fisher_yates_variable(&mut new_chromosome, 0.01);
+                }
+            },
+            2 => {
+                if fastrand::f64() < 0.5 {
+                    new_chromosome.remove(randix);
+                } else {
+                    fisher_yates_variable(&mut new_chromosome, 0.01);
+                }
+            },
+            _ => {
+                unreachable!()
+            },
+        }
+
+        let (valid_chromosome, fitness) = match self.calculate_fitness(new_chromosome){
+            Ok(res) => res,
+            Err(E) => panic!("Error: {E}")
+        };
+
+        individual.chromosome = valid_chromosome;
+        individual.fitness = fitness;
+
+        individual
+
+    }
+
+    fn reproduce_parents(){
+        // calls the crossovers for the parents and starts to populate new generation
+        // TODO: figure out if it would be logical to have the parents survive onto the next generation
+        //       depending on their fitness. Maybe populate the entire generation and then, depending
+        //       on the relative fitness of the parents compared to new generation, make them cross over?
+
+    }
+
+    fn run(){
+
+    }
+
 }
