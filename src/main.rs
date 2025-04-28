@@ -1,11 +1,11 @@
 use std::sync::{Arc, Mutex};
-use crate::graph::Graph;
-use crate::sim_ann_impl::{run_island_model, GaParams, Population, Sim, Summary};
-use std::thread;
-use ndarray::indices;
+use crate::{individual::Individual, population::Population, graph::Graph, genetic::{run_island_model, Summary, GaParams}};
 
 mod graph;
 mod sim_ann_impl;
+mod individual;
+mod population;
+mod genetic;
 
 macro_rules! log_time {
     ($label:expr, $block:block) => {{
@@ -20,6 +20,13 @@ fn main() {
     // WARNING, ANYTHING OVER 10000 crashes your computer
 
 
+    let graph_test: Graph= match Graph::new(10, 1.){
+        Ok(graph) => graph,
+        Err(E) => panic!("{E}")
+    };
+    let mut pop_test = Population::new(200, &graph_test);
+    let mut parents = pop_test.tournament_selection(0.5, 20);
+    pop_test.new_generation(&mut parents, 0.5);
 
 
 
