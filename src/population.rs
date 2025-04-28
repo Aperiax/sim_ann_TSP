@@ -193,10 +193,10 @@ impl<'a> Population<'a> {
 
 
         let mut parents:Vec<Individual> = Vec::new();
-
+        let mut last_chosen_parent = 0;
         for (idx, indiv) in sorted_indivs.iter().enumerate(){
-
-            let sel_proba = fastrand::f64() + elitism_factor;
+            last_chosen_parent = idx;
+            let sel_proba = fastrand::f64();
             if selection_weights[idx] > sel_proba && parents.len() != num_chosen{
                 parents.push(indiv.clone())
             } else {break;}
@@ -206,7 +206,7 @@ impl<'a> Population<'a> {
 
 
         //okay, this crashes the computer
-        for indiv in sorted_indivs.iter().skip(len_of_parents+1) {
+        for indiv in sorted_indivs.iter().skip(last_chosen_parent) {
             let darwin = fastrand::f64();
             if darwin > elitism_factor && parents.len() != num_chosen{
                 parents.push(indiv.clone())
@@ -244,43 +244,6 @@ impl<'a> Population<'a> {
 
         // TODO: figure out something not absolutely brain dead to do the corssovers between parents
 
-        /*
-        [0,1,2,5,4,3,6,7,8,9,0] -> parent 1
-        [0,3,4,2,1,5,6,9,8,7,0] -> parent 2
-
-        now if the parents were always of fixed length, it would be straight forward,
-        but their lengths may change.
-
-        But then again, I can just define slice lengths to be placed on some relative scales
-        of the respective parent's lengths and then just mix and match for the children
-
-        [0,1,2,3,2,5,4,3,6,7,8,9,0] -> parent 1, len 12
-        [0,3,4,2,1,5,6,9,8,7,0] -> parent 2, len 10
-
-        I can just always split the len into thirds and round it if the modulo != 0,
-        then I can randomly choose which of the six segments will be chosen for the child,
-        weighted by the fitness of the parent
-
-        (lower the fitness number, the better. Fitness represents the path length)
-
-        (I can either choose to retain the endpoints, or just cut them off)
-        [0|| 1,2,3,2 | 5,4,3,6 | 7,8,9 ||0] -> parent 1
-        [0|| 3,4,2 | 1,5,6 | 9,8,7 ||0] -> parent 2
-
-        example child -> [3,4,2,5,4,3,6,9,8,7] -> mutate -> calculate its fitness (also closes the path)
-
-        the main problem is the fact that I'd somehow have to figure out how to do the slicing,
-        since it's not always really possible to split neatly.
-
-        I could just check if the path is divisible by 3 with either cut off endpoints, one cut off endpoint,
-        or if both endpoints are included for slicing.
-
-        modulos are expensive, but then again using simple integer division and then subtraction
-        to get the remainder literally costs like 3 cpu cycles instead of 20 to 40 of %.
-
-        a % b ~ a - (a/b) * b
-        */
-
         // generate all parent combinations - doesn't take into account the possible equality
         let parent_pairs: Vec<_> = parents
             .iter()
@@ -292,56 +255,52 @@ impl<'a> Population<'a> {
             })
             .collect();
 
-        // each generation lets only 20 parents live, but htat doesn't mean we'd get 190 parent pairs always.
+        // each generation lets only 20 parents live, but that doesn't mean we'd get 190 parent pairs always.
         // so populating new generations isn't always as straight forward as it might seem
 
         let mut new_generation: Vec<Individual> = Vec::with_capacity(self.pop_size);
 
         for pair in parent_pairs.iter().cloned(){
-            for _ in 1..fastrand::usize(2..4) {
-                let num_segments = 4; // how many segments I'd like to split the chromosome into
+            let num_segments = 4; // how many segments I'd like to split the chromosome into
 
-                let (longer_chromosome, shorter_chromosome) = if pair.0.chromosome.len() >= pair.1.chromosome.len() {
-                    (&pair.0.chromosome, &pair.1.chromosome)
+            let (longer_chromosome, shorter_chromosome) = if pair.0.chromosome.len() >= pair.1.chromosome.len() {
+                (&pair.0.chromosome, &pair.1.chromosome)
+            } else {
+                (&pair.1.chromosome, &pair.0.chromosome)
+            };
+
+            let mut child_chromosome = Vec::with_capacity(longer_chromosome.len().max(shorter_chromosome.len()));
+            let segments_longer_parent = Self::make_segments(longer_chromosome.len(), num_segments);
+            let segments_shorter_parent = Self::make_segments(shorter_chromosome.len(), num_segments);
+
+
+            for i in 0..num_segments {
+                let use_longer = fastrand::bool();
+                let (start, end) = if use_longer {
+                    segments_longer_parent[i]
                 } else {
-                    (&pair.1.chromosome, &pair.0.chromosome)
+                    segments_shorter_parent[i]
                 };
 
-                let mut child_chromosome = Vec::with_capacity(longer_chromosome.len().max(shorter_chromosome.len()));
-                let segments_longer_parent = Self::make_segments(longer_chromosome.len(), num_segments);
-                let segments_shorter_parent = Self::make_segments(shorter_chromosome.len(), num_segments);
-
-
-                for i in 0..num_segments {
-                    let use_longer = fastrand::bool();
-                    let (start, end) = if use_longer {
-                        segments_longer_parent[i]
+                child_chromosome.extend_from_slice(
+                    if use_longer {
+                        &longer_chromosome[start..end]
                     } else {
-                        segments_shorter_parent[i]
-                    };
-
-                    child_chromosome.extend_from_slice(
-                        if use_longer {
-                            &longer_chromosome[start..end]
-                        } else {
-                            &shorter_chromosome[start..end]
-                        }
-                    );
-                }
-                child_chromosome.dedup();
-                let closing_and_fitness = match self.calculate_fitness(&mut child_chromosome) {
-                    Ok(res) => res,
-                    Err(E) => panic!("Error in child generation: {E}")
-                };
-                let child = Individual {
-                    chromosome: child_chromosome,
-                    fitness: closing_and_fitness
-                };
-                new_generation.push(child)
+                        &shorter_chromosome[start..end]
+                    }
+                );
             }
+            child_chromosome.dedup();
+            let closing_and_fitness = match self.calculate_fitness(&mut child_chromosome) {
+                Ok(res) => res,
+                Err(E) => panic!("Error in child generation: {E}")
+            };
+            let child = Individual {
+                chromosome: child_chromosome,
+                fitness: closing_and_fitness
+            };
+            new_generation.push(child)
         }
-
-        new_generation.truncate(self.pop_size);
         new_generation
     }
 
@@ -416,8 +375,7 @@ impl<'a> Population<'a> {
         let mut offspring = self.crossover(&selected_parents);
 
         for child in offspring {
-            if darwin > fastrand::f64(){
-                // another evolutionary layer
+
                 let mut newchild = self.mutate(child);
 
                 let child_indices: HashSet<usize> = newchild.chromosome.clone().into_iter().collect();
@@ -451,18 +409,38 @@ impl<'a> Population<'a> {
                 };
 
                 new_generation.push(final_child);
-            }
+
         }
 
-        if &new_generation.len() != &self.pop_size{
+        if &new_generation.len() <= &self.pop_size{
 
             let pop_diff = &self.pop_size - &new_generation.len();
-            fisher_yates_variable(selected_parents, self.mutation_rate);
+            if pop_diff < selected_parents.len(){
 
-            for parent in selected_parents.iter().take(pop_diff){
-                new_generation.push(parent.clone())
+                fisher_yates_variable(selected_parents, self.mutation_rate);
+
+                for parent in selected_parents.iter().take(pop_diff){
+                    new_generation.push(parent.clone())
+                }
+
+            } else {
+
+                let diff = pop_diff - &selected_parents.len();
+                fisher_yates_variable(selected_parents, self.mutation_rate);
+
+                for parent in selected_parents.iter().cloned(){
+                    new_generation.push(parent);
+                }
+
+                for _ in 0..diff{
+                    let new_indiv = Individual::new(&self.city)?;
+                    new_generation.push(new_indiv);
+                }
+
             }
 
+        } else {
+            new_generation.truncate(self.pop_size);
         }
 
         // resetting the generation field to valid children

@@ -19,7 +19,7 @@ pub struct GaParams {
 pub struct Summary{
     pub best_indiv: Option<Individual>,
     pub island_id: Option<usize>,
-    pub generation: Option<usize>
+    pub generation: Option<usize>,
 }
 
 impl Summary{
@@ -31,7 +31,7 @@ impl Summary{
         if self.best_indiv.is_none() || candidate.fitness < self.best_indiv.as_ref().unwrap().fitness{
             self.best_indiv = Some(candidate);
             self.island_id = Some(island);
-            self.generation = Some(generation)
+            self.generation = Some(generation);
         }
     }
 }
@@ -53,7 +53,7 @@ pub fn run_island_model(graph: Arc<Graph>, params: GaParams, summary: Arc<Mutex<
             }
         }
     }
-
+    println!(" Starting thread spwan ");
 
     // FIXME: the fucking threads are panicking like headless chicken
     for i in 0..params.num_islands{
@@ -62,34 +62,24 @@ pub fn run_island_model(graph: Arc<Graph>, params: GaParams, summary: Arc<Mutex<
         let island_params = params.clone();
         let island_senders = senders[i].clone();
         let island_receivers = receivers[i].clone();
-
+        let island_barrier = barrier.clone();
         let handle = thread::spawn(move ||{
-
-            if i == 1 {
-                println!("From thread:{i}");
-            }
 
             let mut population= Population::new(params.pop_size, &island_graph);
 
-            if i == 1 {
-                println!("Original pop size thread {i} = {}", population.generation.len())
-            }
+            let best_start = population.generation.iter().min_by_key(|ind| ind.fitness).unwrap();
+            println!("Thread {i} best starting: {}", best_start.fitness);
 
             for gen in 0..island_params.max_generation{
 
-                let mut parents = population.tournament_selection(0.5, 20);
-
-                if i == 1 {
-                    println!("Parents chosen in thread {i} in generation {gen}: {}", parents.len());
+                if i == 1
+                {
+                    println!("current gen on core 1: {gen}")
                 }
-
+                let mut parents = population.tournament_selection(0.5, 20);
 
                 // this line is the problem
                 population.new_generation(&mut parents, 0.05).unwrap();
-
-                if i == 1 {
-                    println!("len new pop from thread pre summary update:{i}: {}", &population.generation.len());
-                }
 
                 if let Some(candidate) = population.generation.iter()
                     .min_by_key(|ind| ind.fitness)
@@ -98,14 +88,13 @@ pub fn run_island_model(graph: Arc<Graph>, params: GaParams, summary: Arc<Mutex<
                     sum.update(candidate, i, gen)
                 }
 
+
                 if gen % island_params.migration_interval == 0 && gen > 0{
 
                     let migrants = population.tournament_selection(0.5, island_params.num_migrants);
-
-                    if i == 1 {
-                        println!("Len of chosen migrants in thread {i} = {}", migrants.len());
+                    if i == 2{
+                        println!("Thread {i} migrants: {}", migrants.len())
                     }
-
                     for sender in &island_senders{
                         sender.send(migrants.clone()).unwrap();
                     }
@@ -113,15 +102,31 @@ pub fn run_island_model(graph: Arc<Graph>, params: GaParams, summary: Arc<Mutex<
 
                     let mut all_migrants = Vec::new();
 
+
                     for receiver in &island_receivers{
-                        let incoming = receiver.try_recv().unwrap();
+                        let incoming = receiver.recv().unwrap();
+
                         all_migrants.extend(incoming)
                     }
 
+                    if i == 2{
+                        println!("Thread {i} incoming migrants: {}", all_migrants.len())
+                    }
 
+
+                    if i == 2{
+                        println!("Thread {i}, pre generation extend: {}", population.generation.len())
+                    }
                     population.generation.extend(all_migrants);
+                    if i == 2{
+                        println!("Thread {i}, post generation extend: {}", population.generation.len())
+                    }
                     population.generation.sort_by(|a, b| a.fitness.cmp(&b.fitness));
-                    population.generation.truncate(island_params.pop_size)
+                    population.generation.truncate(island_params.pop_size);
+                    if i == 2{
+                        println!("Thread {i}, post generation truncate: {}", population.generation.len())
+                    }
+                    island_barrier.wait();
 
                 }
             }

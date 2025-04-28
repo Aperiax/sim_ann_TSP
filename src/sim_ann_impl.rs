@@ -10,18 +10,7 @@ use itertools::Itertools;
 
 
 
-/*
-========================= todos =========================
 
-TODO: don't forget to take out profanities
-
-TODO: figure out how to not create duplicate individuals
-      for gen_zero
-
-TODO: make the crossover operator fitness weighed?
-
-==========================================================
-*/
 
 const KB: f64 = 1.;
 const T_MAX: f64 = 1000.;
