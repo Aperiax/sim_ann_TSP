@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use fastrand;
 use itertools::Itertools;
+use log::Level::Warn;
 use ndarray::parallel::prelude::*;
 use rayon::prelude::*;
 
@@ -26,6 +27,8 @@ TODO: parallelize the simulation once we're done =>
 
 ========================================================
 */
+
+#[derive(Debug, Clone)]
 pub struct Graph
 {
     pub vertices: Vec<Vertex>,

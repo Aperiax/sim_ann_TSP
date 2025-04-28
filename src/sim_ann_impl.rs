@@ -3,16 +3,22 @@ use std::collections::{HashSet, VecDeque};
 use std::hash::Hash;
 use fastrand;
 use rayon::prelude::*;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc, Barrier};
 use std::thread;
+use crossbeam::channel::{unbounded, Receiver, Sender};
 use itertools::Itertools;
+
+
+
 /*
 ========================= todos =========================
 
-TODO: make the city insertions/removals not retarded
-TODO: Add subpath optimizations
 TODO: don't forget to take out profanities
-TODO: pralelize the genetic algo by hand, no rayon.
+
+TODO: figure out how to not create duplicate individuals
+      for gen_zero
+
+TODO: make the crossover operator fitness weighed?
 
 ==========================================================
 */
@@ -50,21 +56,59 @@ pub struct EnergyMonitor {
     memory_range: f64,
 }
 
-
-#[derive(Debug)]
-pub struct Population {
-    // I'll most likely not need the pop_size?
-    city: Graph,
+#[derive(Debug, Clone)]
+pub struct Population<'a> {
+    city: &'a Graph,
     pop_size: usize,
     pub generation: Vec<Individual>,
     mutation_rate: f64,
+    best_result_fitness: usize,
+    best_result_chromosome: Vec<usize>
 }
 
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Debug, Clone)]
 pub struct Individual {
-    chromosome: Vec<usize>,
-    fitness: usize,
+    pub chromosome: Vec<usize>,
+    pub fitness: usize,
 }
+
+#[derive(Clone)]
+pub struct GaParams {
+    // general parameters for the top level run
+    pub pop_size: usize,
+    pub max_generation: usize,
+    pub migration_interval: usize,
+    pub num_migrants: usize,
+    pub num_islands: usize, // corresponds to the number of system's threads
+}
+
+#[derive(Debug, Clone)]
+pub struct Summary{
+    pub best_indiv: Option<Individual>,
+    pub island_id: Option<usize>,
+    pub generation: Option<usize>
+}
+
+
+impl Ord for Individual {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.fitness.cmp(&other.fitness)
+    }
+}
+
+impl PartialOrd for Individual {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Individual {
+    fn eq(&self, other: &Self) -> bool {
+        self.chromosome == other.chromosome
+    }
+}
+
+impl Eq for Individual {}
 
 pub enum MonitorAction{
 
@@ -119,7 +163,6 @@ pub fn zscore(en_delta:f64, stdev:f64, mean:f64) -> f64 {
     z_t
 
 }
-
 
 impl Sim {
 
@@ -895,6 +938,20 @@ impl EnergyMonitor {
     }
 }
 
+impl Summary{
+    pub fn new() -> Self{
+        Summary{best_indiv: None, island_id: None, generation:None}
+    }
+
+    fn update(&mut self, candidate: Individual, island:usize, generation:usize){
+        if self.best_indiv.is_none() || candidate.fitness < self.best_indiv.as_ref().unwrap().fitness{
+            self.best_indiv = Some(candidate);
+            self.island_id = Some(island);
+            self.generation = Some(generation)
+        }
+    }
+}
+
 impl Individual {
     fn new(city: &Graph) -> Result<Self, String>{
 
@@ -932,7 +989,11 @@ impl Individual {
 
 
         while indices != seen_vertices {
+
             let mut neighbor_list = city_map.get_neighbors(idx)?;
+
+            // shuffle the neighbor lists - make it random, very random
+            fisher_yates_variable(&mut neighbor_list, fastrand::f64());
 
             let mut next_index = None;
 
@@ -988,8 +1049,8 @@ impl Individual {
     }
 }
 
-impl Population {
-    pub fn new(pop_size:usize, city: Graph) -> Self{
+impl<'a> Population<'a> {
+    pub fn new(pop_size:usize, city: &'a Graph) -> Self{
 
         // population sizes are going to be the same for each generation,
         // it's mostly about how I splice and mix and mutate the parents
@@ -1006,13 +1067,15 @@ impl Population {
             city: city,
             pop_size: pop_size,
             generation: individuals,
-            mutation_rate: 0.05
+            mutation_rate: 0.05, // weigh this by iteration/temperature
+            best_result_chromosome: Vec::new(),
+            best_result_fitness: 0
         }
 
 
     }
 
-    fn spawn_generation_zero(city_map: &Graph, pop_size: usize, max_threads: usize) -> Result<Vec<Individual>, String>{
+    fn spawn_generation_zero(city_map: &'a Graph, pop_size: usize, max_threads: usize) -> Result<Vec<Individual>, String>{
 
         /*
         It's fast.
@@ -1080,7 +1143,7 @@ impl Population {
         Ok(results)
     }
 
-    fn calculate_fitness(&mut self, chromosome:Vec<usize>) -> Result<(Vec<usize>, usize), String>{
+    fn calculate_fitness(&self, chromosome_to_calculate:&mut Vec<usize>) -> Result<usize, String>{
 
         /*
         calculate fitness of an individual
@@ -1089,31 +1152,29 @@ impl Population {
          */
 
         let city = &self.city;
-        let mut chromosome_to_calculate = chromosome.clone();
 
-        //closes the path if it was not so at the start
-        if chromosome_to_calculate.last() != chromosome_to_calculate.first(){
-            chromosome_to_calculate.push(*chromosome_to_calculate.first().unwrap());
+        if let (Some(&first), Some(&last)) = (chromosome_to_calculate.first(), chromosome_to_calculate.last()){
+            if first != last {
+                chromosome_to_calculate.push(first)
+            }
         }
 
         let fitness:usize = chromosome_to_calculate
             .windows(2)
-            .par_bridge()
             .map(|a| {
-                let weight = match city.get_edge_weight(*a.get(0).unwrap(), *a.get(1).unwrap()){
+                match city.get_edge_weight(a[0], a[1]){
                     Ok(weight) => weight,
-                    Err(E) => panic!("Something's wrong, I can feel it")
-                };
-                weight
+                    Err(E) => panic!("Got this: {E}")
+                }
             })
             .sum();
 
 
-        Ok((chromosome_to_calculate, fitness))
+        Ok(fitness)
 
     }
 
-    pub fn tournament_selection(&mut self, elitism_factor: f64) -> Vec<Individual>{
+    pub fn tournament_selection(&mut self, elitism_factor: f64, num_chosen: usize) -> Vec<Individual>{
 
         // elitism factor is a further regularization to take the
         // survival of the fittest to overdrive. Reduces the 200 population to
@@ -1121,18 +1182,23 @@ impl Population {
 
         // sort the individuals by fitness in descending order
         // well, the fitness is in ascending order, but the
-        // individual's viability is in descening
+        // individual's viability is in ascending order, ***the lower, the better***!!!
 
-        let sorted_indivs: Vec<Individual> = self.generation
+        // tournament selection also handles saving the best results found so far for the final result
+
+        // i just need to peek the individuals, not clone them, so I'm getting a vector of pointers here
+        let sorted_indivs: &Vec<Individual> = &self.generation
             .clone()
             .into_iter()
             .sorted_by(|a, b| a.fitness.cmp(&b.fitness))
             .collect();
 
-
         let best_fit = sorted_indivs.first().map(|x| x.fitness).unwrap_or(0) as f64;
         let worst_fit = sorted_indivs.last().map(|x|x.fitness).unwrap_or(0) as f64;
-        println!("worst fitness: {worst_fit}");
+
+        self.best_result_fitness = best_fit as usize;
+        self.best_result_chromosome = sorted_indivs[0].clone().chromosome;
+
 
         // the higher the weight, the more fit the individual is in the selection
         // yes, this is just a minmax scaler
@@ -1149,23 +1215,158 @@ impl Population {
         for (idx, indiv) in sorted_indivs.iter().enumerate(){
 
             let sel_proba = fastrand::f64() + elitism_factor;
-            if selection_weights[idx] > sel_proba{
+            if selection_weights[idx] > sel_proba && parents.len() != num_chosen{
+                parents.push(indiv.clone())
+            } else {break;}
+        }
+
+        let len_of_parents = parents.clone().iter().len();
+
+
+        //okay, this crashes the computer
+        for indiv in sorted_indivs.iter().skip(len_of_parents+1) {
+            let darwin = fastrand::f64();
+            if darwin > elitism_factor && parents.len() != num_chosen{
                 parents.push(indiv.clone())
             }
+            if parents.len() == num_chosen {break;}
         }
 
         //println!("Selected parents: {:?}", parents);
-        println!("Num selected: {}", parents.len());
         parents
-
 
     }
 
-    fn crossover(&self, parents: Vec<Individual>){
+    fn make_segments(len:usize, n_segments:usize) -> Vec<(usize, usize)>{
+        // returns a vector of indices - the chunks that I'll later draw from chromosomes
+        // helper function
+        let base = len / n_segments;
+        let rem = len - base * n_segments;
+
+        let mut offsets = Vec::with_capacity(n_segments + 1);
+        offsets.push(0);
+
+        for i in 0..n_segments{
+            let extra = if i < rem {1} else {0};
+            let next = offsets[i] + base + extra;
+
+            offsets.push(next);
+        };
+
+        let segments = offsets.windows(2).map(|w| (w[0], w[1])).collect::<Vec<(usize, usize)>>();
+        segments
+
+    }
+
+    pub fn crossover(&self, parents: &[Individual])-> Vec<Individual>{
 
         // TODO: figure out something not absolutely brain dead to do the corssovers between parents
 
+        /*
+        [0,1,2,5,4,3,6,7,8,9,0] -> parent 1
+        [0,3,4,2,1,5,6,9,8,7,0] -> parent 2
+
+        now if the parents were always of fixed length, it would be straight forward,
+        but their lengths may change.
+
+        But then again, I can just define slice lengths to be placed on some relative scales
+        of the respective parent's lengths and then just mix and match for the children
+
+        [0,1,2,3,2,5,4,3,6,7,8,9,0] -> parent 1, len 12
+        [0,3,4,2,1,5,6,9,8,7,0] -> parent 2, len 10
+
+        I can just always split the len into thirds and round it if the modulo != 0,
+        then I can randomly choose which of the six segments will be chosen for the child,
+        weighted by the fitness of the parent
+
+        (lower the fitness number, the better. Fitness represents the path length)
+
+        (I can either choose to retain the endpoints, or just cut them off)
+        [0|| 1,2,3,2 | 5,4,3,6 | 7,8,9 ||0] -> parent 1
+        [0|| 3,4,2 | 1,5,6 | 9,8,7 ||0] -> parent 2
+
+        example child -> [3,4,2,5,4,3,6,9,8,7] -> mutate -> calculate its fitness (also closes the path)
+
+        the main problem is the fact that I'd somehow have to figure out how to do the slicing,
+        since it's not always really possible to split neatly.
+
+        I could just check if the path is divisible by 3 with either cut off endpoints, one cut off endpoint,
+        or if both endpoints are included for slicing.
+
+        modulos are expensive, but then again using simple integer division and then subtraction
+        to get the remainder literally costs like 3 cpu cycles instead of 20 to 40 of %.
+
+        a % b ~ a - (a/b) * b
+        */
+
+        // generate all parent combinations - doesn't take into account the possible equality
+        let parent_pairs: Vec<_> = parents
+            .iter()
+            .combinations(2)
+            .filter_map(|x| if x[0] != x[1]{
+                Some((x[0].clone(), x[1].clone()))
+            }else{
+                None
+            })
+            .collect();
+
+        // each generation lets only 20 parents live, but htat doesn't mean we'd get 190 parent pairs always.
+        // so populating new generations isn't always as straight forward as it might seem
+
+        let mut new_generation: Vec<Individual> = Vec::with_capacity(self.pop_size);
+
+        for _ in 0..fastrand::usize(1..4){
+            for pair in parent_pairs.iter().cloned(){
+
+                let num_segments = 4; // how many segments I'd like to split the chromosome into
+
+                let (longer_chromosome, shorter_chromosome) = if pair.0.chromosome.len() >= pair.1.chromosome.len() {
+                    (pair.0.chromosome, pair.1.chromosome)
+                } else {
+                    (pair.1.chromosome, pair.0.chromosome)
+                };
+
+                let mut child_chromosome = Vec::with_capacity(longer_chromosome.len().max(shorter_chromosome.len()));
+                let segments_longer_parent = Self::make_segments(longer_chromosome.len(), num_segments);
+                let segments_shorter_parent = Self::make_segments(shorter_chromosome.len(), num_segments);
+
+
+                for i in 0..num_segments{
+
+                    let use_longer = fastrand::bool();
+                    let (start, end) = if use_longer{
+                        segments_longer_parent[i]
+                    } else {
+                        segments_shorter_parent[i]
+                    };
+
+                    child_chromosome.extend_from_slice(
+                        if use_longer {
+                            &longer_chromosome[start..end]
+                        } else {
+                            &shorter_chromosome[start..end]
+                        }
+                    );
+
+
+                }
+                child_chromosome.dedup();
+                let closing_and_fitness = match self.calculate_fitness(&mut child_chromosome){
+                    Ok(res) => res,
+                    Err(E) => panic!("Error in child generation: {E}")
+                };
+                let child = Individual{
+                    chromosome: child_chromosome,
+                    fitness: closing_and_fitness
+                };
+                new_generation.push(child)
+            }
+        }
+
+        new_generation.truncate(self.pop_size);
+        new_generation
     }
+
     fn mutate(&mut self, mut individual: Individual) -> Individual{
 
         // chooses a random index in the chromosome and performs one of three actions
@@ -1187,7 +1388,7 @@ impl Population {
             1 => {
                 //inserts a random city to the path
                 let randinsert = fastrand::usize(0..self.city.size);
-                if fastrand::f64() < 0.5 {
+                if fastrand::f64() < self.mutation_rate + 0.02 {
                     //coin toss for insertion
                     new_chromosome.insert(randix, randinsert)
                 } else {
@@ -1196,7 +1397,7 @@ impl Population {
                 }
             },
             2 => {
-                if fastrand::f64() < 0.5 {
+                if fastrand::f64() < self.mutation_rate {
                     new_chromosome.remove(randix);
                 } else {
                     fisher_yates_variable(&mut new_chromosome, 0.01);
@@ -1207,28 +1408,188 @@ impl Population {
             },
         }
 
-        let (valid_chromosome, fitness) = match self.calculate_fitness(new_chromosome){
+        new_chromosome.dedup();
+        let fitness = match self.calculate_fitness(&mut new_chromosome){
             Ok(res) => res,
             Err(E) => panic!("Error: {E}")
         };
 
-        individual.chromosome = valid_chromosome;
+        individual.chromosome = new_chromosome;
         individual.fitness = fitness;
 
         individual
 
     }
 
-    fn reproduce_parents(){
+    pub fn new_generation(&mut self, selected_parents:&mut Vec<Individual>, darwin: f64) -> Result<(), String>{
         // calls the crossovers for the parents and starts to populate new generation
+        // not the most elegant code I've written, but as long as it works
+
         // TODO: figure out if it would be logical to have the parents survive onto the next generation
         //       depending on their fitness. Maybe populate the entire generation and then, depending
         //       on the relative fitness of the parents compared to new generation, make them cross over?
 
+
+        let required_indices: HashSet<usize> = (0..self.city.size).collect();
+
+        // reproduce and mutate children
+        let mut new_generation: Vec<Individual> = Vec::with_capacity(self.pop_size);
+
+        let mut offspring = self.crossover(&selected_parents);
+
+        for child in offspring {
+            if darwin > fastrand::f64(){
+                 // another evolutionary layer
+                let mut newchild = self.mutate(child);
+
+                let child_indices: HashSet<usize> = newchild.chromosome.clone().into_iter().collect();
+
+                // validation check
+                if child_indices != required_indices{
+
+                    let missing: Vec<usize> = required_indices.difference(&child_indices).cloned().collect::<Vec<usize>>();
+
+                    for &val in &missing {
+                        let randidx = fastrand::usize(0..newchild.chromosome.len());
+                        newchild.chromosome.insert(randidx, val);
+                    }
+
+                }
+
+                // very unsightly way of returning the closed path chromosome along with it's fitness
+                let mut closed_and_calcd = match self.calculate_fitness(&mut newchild.chromosome){
+                    Ok(res) => res,
+                    Err(E) => panic!("err: {E}")
+                };
+
+                // removing illegal self-loops, dedup maintains the validity of the path by only
+                // removing one of the repeating indices, as long as they repeat right after each other
+                newchild.chromosome.dedup();
+
+                // due to some Rust internals, I need to construct a whole ass new individual object
+                let final_child = Individual{
+                    chromosome: newchild.chromosome,
+                    fitness: closed_and_calcd
+                };
+
+                new_generation.push(final_child);
+            }
+        }
+
+        if &new_generation.len() != &self.pop_size{
+
+            let pop_diff = &self.pop_size - &new_generation.len();
+            fisher_yates_variable(selected_parents, self.mutation_rate);
+
+            for parent in selected_parents.iter().take(pop_diff){
+                new_generation.push(parent.clone())
+            }
+
+        }
+
+        // resetting the generation field to valid children
+        self.generation = new_generation;
+
+        Ok(())
+    }
+}
+
+pub fn run_island_model(graph: Arc<Graph>, params: GaParams, summary: Arc<Mutex<Summary>>){
+
+    let mut handles = Vec::with_capacity(params.num_islands);
+    let barrier = Arc::new(Barrier::new(params.num_islands));
+
+    let mut senders: Vec<Vec<Sender<Vec<Individual>>>> = vec![Vec::new(); params.num_islands];
+    let mut receivers: Vec<Vec<Receiver<Vec<Individual>>>> = vec![Vec::new(); params.num_islands];
+
+    for i in 0..params.num_islands{
+        for j in 0..params.num_islands{
+            if i != j{
+                let (s,r) = unbounded();
+                senders[i].push(s);
+                receivers[j].push(r)
+            }
+        }
     }
 
-    fn run(){
 
+    // FIXME: the fucking threads are panicking like headless chicken
+    for i in 0..params.num_islands{
+        let island_summary = Arc::clone(&summary);
+        let island_graph = Arc::clone(&graph);
+        let island_params = params.clone();
+        let island_senders = senders[i].clone();
+        let island_receivers = receivers[i].clone();
+        let island_barrier = barrier.clone();
+
+        let handle = thread::spawn(move ||{
+
+            if i == 1 {
+                println!("From thread:{i}");
+            }
+
+            let mut population= Population::new(params.pop_size, &island_graph);
+
+            if i == 1 {
+                println!("Original pop size thread {i} = {}", population.generation.len())
+            }
+
+            for gen in 0..island_params.max_generation{
+
+                let mut parents = population.tournament_selection(0.5, 20);
+
+                if i == 1 {
+                    println!("Parents chosen in thread {i} in generation {gen}: {}", parents.len());
+                }
+
+                population.new_generation(&mut parents, 0.05).unwrap();
+
+                if i == 1 {
+                    println!("len new pop from thread pre summary update:{i}: {}", &population.generation.len());
+                }
+
+                if let Some(candidate) = population.generation.iter()
+                    .min_by_key(|ind| ind.fitness)
+                    .cloned(){
+                    let mut sum = island_summary.lock().unwrap();
+                    sum.update(candidate, i, gen)
+                }
+
+                if gen % island_params.migration_interval == 0 && gen > 0{
+
+                    let migrants = population.tournament_selection(0.5, island_params.num_migrants);
+                    island_barrier.wait();
+
+                    if i == 1 {
+                        println!("Len of chosen migrants in thread {i} = {}", migrants.len());
+                    }
+
+                    for sender in &island_senders{
+                        sender.send(migrants.clone()).unwrap();
+                    }
+
+                    island_barrier.wait();
+
+                    let mut all_migrants = Vec::new();
+
+                    for receiver in &island_receivers{
+                        let incoming = receiver.recv().unwrap();
+                        all_migrants.extend(incoming)
+                    }
+
+                    island_barrier.wait();
+
+                    population.generation.extend(all_migrants);
+                    population.generation.sort_by(|a, b| a.fitness.cmp(&b.fitness));
+                    population.generation.truncate(island_params.pop_size)
+
+                }
+            }
+        });
+        handles.push(handle)
     }
-
+    for handle in handles{
+        handle.join().unwrap();
+    }
+    println!("All islands finished successfully")
 }
