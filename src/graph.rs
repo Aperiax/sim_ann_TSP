@@ -1,10 +1,9 @@
 use ndarray::{Array2, Axis};
-use rand::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use fastrand;
 use itertools::Itertools;
-use log::Level::Warn;
 use ndarray::parallel::prelude::*;
 use rayon::prelude::*;
 
@@ -14,7 +13,7 @@ pub struct Vertex
 {
     // equivalent to the column labels in pandas
     pub id: usize,
-    pub name: String,
+    pub name: Arc<str>,
 }
 /*
 ======================== TODOS =========================
@@ -32,20 +31,17 @@ TODO: parallelize the simulation once we're done =>
 pub struct Graph
 {
     pub vertices: Vec<Vertex>,
-    pub name_to_id: HashMap<String, usize>,
     pub adjacency_matrix: Array2<usize>,
     pub size: usize,
 }
 
 impl Vertex {
-    pub fn new(id: usize, name:&String) -> Self{
+    pub fn new(id: usize, name:&str) -> Self{
         
-        let name_unwrapped = name.clone();
-
         Vertex
         {
             id: id,
-            name: name_unwrapped,
+            name: Arc::from(name),
         }
 
     }
@@ -64,7 +60,7 @@ impl Graph{
 
         let adjacency_matrix:Array2<usize> = Array2::zeros((size, size));
 
-        let mut possible_edges:Vec<(usize, usize)> = Self::precalculate_all_possible_edges(size);
+        let mut possible_edges:Vec<(usize, usize)> = Self::precalculate_all_possible_edges(size, cons_to_use);
         let vertex_names: Vec<String> = Self::generate_vertex_names(num_vertices);
 
         let vertices: Vec<Vertex> = vertex_names.iter()
@@ -72,14 +68,9 @@ impl Graph{
             .map(|(id, name)| Vertex::new(id, name))
             .collect();
 
-        let name_to_id = vertices.iter()
-            .map(|v| (v.name.clone(), v.id))
-            .collect();
-
         // initialize an empty graph first
         let mut graph =  Graph {
             vertices,
-            name_to_id,
             adjacency_matrix,
             size
         };
@@ -121,16 +112,16 @@ impl Graph{
         vertex_names
     }
 
-    fn precalculate_all_possible_edges(size:usize) -> Vec<(usize, usize)>{
+    fn precalculate_all_possible_edges(size:usize, cons_to_use:usize) -> Vec<(usize, usize)>{
 
         // okay, this is *very* fast now
-        let mut possible_edges: Vec<(usize, usize)> = (0..size)
-            .tuple_combinations()
-            .par_bridge()
-            .collect();
-
-        println!("possible amount of edges: {}", possible_edges.len());
-        possible_edges
+        let mut edges = Vec::with_capacity(cons_to_use); 
+        for i in 0..size{
+            for j in (i+1)..size{
+                edges.push((i,j))
+            }
+        };
+        edges
     }
 
     fn kill_orphans(&mut self) -> Result<(), String>{

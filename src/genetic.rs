@@ -65,7 +65,7 @@ pub fn run_island_model(graph: Arc<Graph>, params: GaParams, summary: Arc<Mutex<
         let island_barrier = barrier.clone();
         let handle = thread::spawn(move ||{
 
-            let mut population= Population::new(params.pop_size, &island_graph);
+            let mut population= Population::new(params.pop_size, island_graph);
 
             let best_start = population.generation.iter().min_by_key(|ind| ind.fitness).unwrap();
             println!("Thread {i} best starting: {}", best_start.fitness);

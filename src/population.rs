@@ -4,9 +4,6 @@ use std::thread;
 use itertools::Itertools;
 use crate::{individual::Individual, graph::Graph};
 
-
-
-
 pub fn fisher_yates_variable<T>(iter: &mut Vec<T>, shuffle_frac:f64) -> &mut Vec<T> {
 
     // just a fast~ish shuffle that can swap a certain degree of iterator
@@ -23,16 +20,16 @@ pub fn fisher_yates_variable<T>(iter: &mut Vec<T>, shuffle_frac:f64) -> &mut Vec
     iter
 }
 #[derive(Debug, Clone)]
-pub struct Population<'a> {
-    city: &'a Graph,
+pub struct Population {
+    city: Arc<Graph>,
     pop_size: usize,
     pub generation: Vec<Individual>,
     mutation_rate: f64,
     best_result_fitness: usize,
     best_result_chromosome: Vec<usize>
 }
-impl<'a> Population<'a> {
-    pub fn new(pop_size:usize, city: &'a Graph) -> Self{
+impl Population {
+    pub fn new(pop_size:usize, city: Arc<Graph>) -> Self{
 
         // population sizes are going to be the same for each generation,
         // it's mostly about how I splice and mix and mutate the parents
@@ -40,7 +37,7 @@ impl<'a> Population<'a> {
 
 
         // sleek way to do it with rayon. but where's the fun in that
-        let individuals = match Self::spawn_generation_zero(&city, pop_size, 8){
+        let individuals = match Self::spawn_generation_zero(Arc::clone(&city), pop_size, 8){
             Ok(generation) => generation,
             Err(E) => panic!("Generation spawning failed"),
         };
@@ -57,13 +54,13 @@ impl<'a> Population<'a> {
 
     }
 
-    fn spawn_generation_zero(city_map: &'a Graph, pop_size: usize, max_threads: usize) -> Result<Vec<Individual>, String>{
+    fn spawn_generation_zero(city_map: Arc<Graph>, pop_size: usize, max_threads: usize) -> Result<Vec<Individual>, String>{
 
         /*
         It's fast.
          */
 
-        let city_map = Arc::new(city_map.clone());
+        
 
         //input channel = job queue
         let (task_tx, task_rx) = mpsc::channel::<()>();
@@ -89,7 +86,7 @@ impl<'a> Population<'a> {
                     };
                     match job {
                         Ok(()) => {
-                            let out = Individual::new(&city_map);
+                            let out = Individual::new(Arc::clone(&city_map));
                             res_tx.send(out).expect("res_tx failed to send");
                         },
                         Err(_) => {
@@ -172,7 +169,7 @@ impl<'a> Population<'a> {
         let sorted_indivs: &Vec<Individual> = &self.generation
             .clone()
             .into_iter()
-            .sorted_by(|a, b| a.fitness.cmp(&b.fitness))
+            .sorted_unstable_by_key(|a| a.fitness)
             .collect();
 
         let best_fit = sorted_indivs.first().map(|x| x.fitness).unwrap_or(0) as f64;
@@ -433,7 +430,7 @@ impl<'a> Population<'a> {
                 }
 
                 for _ in 0..diff{
-                    let new_indiv = Individual::new(&self.city)?;
+                    let new_indiv = Individual::new(Arc::clone(&self.city))?;
                     new_generation.push(new_indiv);
                 }
 
