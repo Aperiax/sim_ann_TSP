@@ -55,7 +55,6 @@ pub fn run_island_model(graph: Arc<Graph>, params: GaParams, summary: Arc<Mutex<
     }
     println!(" Starting thread spwan ");
 
-    // FIXME: the fucking threads are panicking like headless chicken
     for i in 0..params.num_islands{
         let island_summary = Arc::clone(&summary);
         let island_graph = Arc::clone(&graph);
