@@ -26,9 +26,6 @@ pub struct Vertex
 TODO: allow for non-usize edge weights => that was a
       needless rabbit hole, I'll jsut go with casting
       back and forth, since it's O(1) anyway.
-TODO: parallelize the simulation once we're done =>
-      screw that.
-
 ========================================================
 */
 
