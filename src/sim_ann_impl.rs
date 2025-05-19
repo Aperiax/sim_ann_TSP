@@ -9,9 +9,6 @@ use crossbeam::channel::{unbounded, Receiver, Sender};
 use itertools::Itertools;
 
 
-
-
-
 const KB: f64 = 1.;
 const T_MAX: f64 = 1000.;
 const T_MIN: f64 = 10.;
@@ -298,7 +295,7 @@ impl Sim {
 
     }
 
-    pub fn run(&mut self, nsteps: usize) -> Result<(Vec<usize>, usize), String>{
+    pub fn run(&mut self, nsteps: usize) -> Result<(Vec<usize>, Vec<usize>, usize), String>{
     //Core sim runner
         let mut iter = 1;
         // the current solution is going to get updated, it's currently a pointer undercover to
@@ -307,7 +304,7 @@ impl Sim {
         let mut en = self.energy.clone();
         let size_init = self.path.len().clone();
         let mut max_iter = nsteps;
-
+        let mut init_path:Vec<usize> = Vec::new();
         println!("********WELCOME********");
         println!("Initiating simulated annealing run");
         println!("Initial solution \"energy\": {en}");
@@ -324,7 +321,6 @@ impl Sim {
                  ==== GENERAL SETUP ====
 
                 */
-
                 let mut sim_temp = self.temp.clone();
                 self.close_path()?;
                 // okay, start off with cloning whatever I would need to use for later rejecting/accepting
@@ -332,7 +328,9 @@ impl Sim {
                 let pre_perturb_config = self.path.clone();
                 let pre_perturb_energy = self.energy.clone() as f64;
 
-
+                if iter == 0{
+                    init_path = pre_perturb_config.clone()
+                }
                 // perturb config at the start of each iteration step - has the chance to append new cities
                 self.perturb_config(0.1, "normal")?;
 
@@ -384,7 +382,6 @@ impl Sim {
                         self.temp += delta;
                     },
                     MonitorAction::Update_best_path{update} => {
-                        println!("New optimim discovered!");
                         self.best_path = iter_config.clone();
                         self.best_en = iter_energy as usize;
                     }
@@ -498,7 +495,8 @@ impl Sim {
             println!("Optimization succesful!")
         }
         println!("{:?}", self.best_path);
-        Ok((self.best_path.clone(), self.best_en.clone()))
+        println!("{}", self.best_en);
+        Ok((self.best_path.clone(), init_path.clone(), self.best_en.clone()))
     }
 
     fn nested_sim_ann(&self, start_city:usize, end_city:usize, must_visit: &HashSet<usize>) -> Result<Vec<usize>, String>{
@@ -860,7 +858,7 @@ impl EnergyMonitor {
         let action:MonitorAction = if plateau_check {
             MonitorAction::PertrubAndIncrease {
                 shuffle_frac: self.calc_shuffle_factor(plateau_check)?,
-                delta: 100.,
+                delta: 600.,
             }
         } else if update_path{
             MonitorAction::Update_best_path {

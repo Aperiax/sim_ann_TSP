@@ -1,19 +1,24 @@
 use ndarray::{Array2, Axis};
+use rand::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
 use fastrand;
 use itertools::Itertools;
+use log::Level::Warn;
 use ndarray::parallel::prelude::*;
 use rayon::prelude::*;
 
+use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::Read;
+use serde_json;
 
 #[derive(Debug, Clone)]
 pub struct Vertex
 {
     // equivalent to the column labels in pandas
     pub id: usize,
-    pub name: Arc<str>,
+    pub name: String,
 }
 /*
 ======================== TODOS =========================
@@ -31,17 +36,27 @@ TODO: parallelize the simulation once we're done =>
 pub struct Graph
 {
     pub vertices: Vec<Vertex>,
+    pub name_to_id: HashMap<String, usize>,
     pub adjacency_matrix: Array2<usize>,
     pub size: usize,
 }
 
+#[derive(Serialize, Deserialize)]
+#[derive(Debug)]
+struct GraphData {
+    number_of_cities: usize,
+    edge_list: Vec<[usize; 3]>
+}
+
 impl Vertex {
-    pub fn new(id: usize, name:&str) -> Self{
+    pub fn new(id: usize, name:&String) -> Self{
         
+        let name_unwrapped = name.clone();
+
         Vertex
         {
             id: id,
-            name: Arc::from(name),
+            name: name_unwrapped,
         }
 
     }
@@ -60,7 +75,7 @@ impl Graph{
 
         let adjacency_matrix:Array2<usize> = Array2::zeros((size, size));
 
-        let mut possible_edges:Vec<(usize, usize)> = Self::precalculate_all_possible_edges(size, cons_to_use);
+        let mut possible_edges:Vec<(usize, usize)> = Self::precalculate_all_possible_edges(size);
         let vertex_names: Vec<String> = Self::generate_vertex_names(num_vertices);
 
         let vertices: Vec<Vertex> = vertex_names.iter()
@@ -68,9 +83,14 @@ impl Graph{
             .map(|(id, name)| Vertex::new(id, name))
             .collect();
 
+        let name_to_id = vertices.iter()
+            .map(|v| (v.name.clone(), v.id))
+            .collect();
+
         // initialize an empty graph first
         let mut graph =  Graph {
             vertices,
+            name_to_id,
             adjacency_matrix,
             size
         };
@@ -103,6 +123,52 @@ impl Graph{
         Ok(graph)
     }
 
+    pub fn from_json(json_path:&str) -> Result<Self, String>{
+        
+        // a method to make the graph from pre-defined data
+
+        let mut file = File::open(json_path)
+            .map_err(|e| format!("Failed to open the json file: {}",e))?;
+        
+        let mut json_string: String = String::new();
+        file.read_to_string(&mut json_string)
+        .map_err(|e| format!("Failed to read the JSON file: {}", e))?;
+        
+        let graph_data: GraphData = serde_json::from_str(&json_string)
+        .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+        
+        let num_vertices = graph_data.number_of_cities;
+        let adjacency_matrix = Array2::zeros((num_vertices, num_vertices));
+        let vertex_names = Self::generate_vertex_names(num_vertices);
+
+        let vertices: Vec<Vertex> = vertex_names.iter()
+            .enumerate()
+            .map(|(id, name)| Vertex::new(id, name))
+            .collect();
+
+        let name_to_id: HashMap<String, usize> = vertices.iter()
+            .map(|v| (v.name.clone(), v.id))
+            .collect();
+
+        let mut graph = Graph{
+            vertices,
+            name_to_id,
+            adjacency_matrix,
+            size: num_vertices,
+        }; 
+
+        for edge in graph_data.edge_list{
+            let from = edge[0];
+            let to = edge[1];
+            let weight = edge[2];
+
+            graph.make_an_edge_weighed(from, to, weight);
+        };
+        
+        Ok(graph)
+    }
+
+
     fn generate_vertex_names(num_vertices: usize) -> Vec<String>{
 
         let mut vertex_names: Vec<String> = Vec::new();
@@ -112,16 +178,15 @@ impl Graph{
         vertex_names
     }
 
-    fn precalculate_all_possible_edges(size:usize, cons_to_use:usize) -> Vec<(usize, usize)>{
+    fn precalculate_all_possible_edges(size:usize) -> Vec<(usize, usize)>{
 
         // okay, this is *very* fast now
-        let mut edges = Vec::with_capacity(cons_to_use); 
-        for i in 0..size{
-            for j in (i+1)..size{
-                edges.push((i,j))
-            }
-        };
-        edges
+        let mut possible_edges: Vec<(usize, usize)> = (0..size)
+            .tuple_combinations()
+            .par_bridge()
+            .collect();
+
+        possible_edges
     }
 
     fn kill_orphans(&mut self) -> Result<(), String>{

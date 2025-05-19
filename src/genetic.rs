@@ -65,21 +65,22 @@ pub fn run_island_model(graph: Arc<Graph>, params: GaParams, summary: Arc<Mutex<
         let island_barrier = barrier.clone();
         let handle = thread::spawn(move ||{
 
-            let mut population= Population::new(params.pop_size, island_graph);
+            let mut population= Population::new(params.pop_size, &island_graph);
 
             let best_start = population.generation.iter().min_by_key(|ind| ind.fitness).unwrap();
             println!("Thread {i} best starting: {}", best_start.fitness);
+            island_barrier.wait();
 
             for gen in 0..island_params.max_generation{
 
-                if i == 1
+                if i == 1 && gen % 100 == 0
                 {
                     println!("current gen on core 1: {gen}")
                 }
                 let mut parents = population.tournament_selection(0.5, 20);
 
                 // this line is the problem
-                population.new_generation(&mut parents, 0.05).unwrap();
+                population.new_generation(&mut parents).unwrap();
 
                 if let Some(candidate) = population.generation.iter()
                     .min_by_key(|ind| ind.fitness)
@@ -90,42 +91,23 @@ pub fn run_island_model(graph: Arc<Graph>, params: GaParams, summary: Arc<Mutex<
 
 
                 if gen % island_params.migration_interval == 0 && gen > 0{
-
+                    island_barrier.wait();
                     let migrants = population.tournament_selection(0.5, island_params.num_migrants);
-                    if i == 2{
-                        println!("Thread {i} migrants: {}", migrants.len())
-                    }
                     for sender in &island_senders{
                         sender.send(migrants.clone()).unwrap();
                     }
-
-
+                    island_barrier.wait();
                     let mut all_migrants = Vec::new();
 
-
+                    island_barrier.wait();
                     for receiver in &island_receivers{
                         let incoming = receiver.recv().unwrap();
 
                         all_migrants.extend(incoming)
                     }
-
-                    if i == 2{
-                        println!("Thread {i} incoming migrants: {}", all_migrants.len())
-                    }
-
-
-                    if i == 2{
-                        println!("Thread {i}, pre generation extend: {}", population.generation.len())
-                    }
                     population.generation.extend(all_migrants);
-                    if i == 2{
-                        println!("Thread {i}, post generation extend: {}", population.generation.len())
-                    }
                     population.generation.sort_by(|a, b| a.fitness.cmp(&b.fitness));
                     population.generation.truncate(island_params.pop_size);
-                    if i == 2{
-                        println!("Thread {i}, post generation truncate: {}", population.generation.len())
-                    }
                     island_barrier.wait();
 
                 }

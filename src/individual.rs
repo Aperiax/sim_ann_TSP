@@ -1,8 +1,5 @@
 use std::collections::HashSet;
 use crate::graph::Graph;
-use std::sync::Arc;
-
-
 #[derive(Debug, Clone)]
 pub struct Individual {
     pub chromosome: Vec<usize>,
@@ -42,7 +39,7 @@ pub fn fisher_yates_variable<T>(iter: &mut Vec<T>, shuffle_frac:f64) -> &mut Vec
 }
 
 impl Individual {
-    pub fn new(city: Arc<Graph>) -> Result<Self, String>{
+    pub fn new(city: &Graph) -> Result<Self, String>{
 
         //wraping the individual in a result so that I can paralelize generating the population
 
@@ -59,7 +56,7 @@ impl Individual {
         Ok(individual)
     }
 
-    pub fn generate_individual(city_map: Arc<Graph>) -> Result<(Vec<usize>, usize), String> {
+    pub fn generate_individual(city_map: &Graph) -> Result<(Vec<usize>, usize), String> {
         let mut fitness: usize = 0;
         let size = city_map.size.clone();
         let mut idx = fastrand::usize(0..size);
